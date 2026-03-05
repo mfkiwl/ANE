@@ -74,17 +74,17 @@ static void io_write_fp16_at(IOSurfaceRef s, int ch_off, const float *data, int 
     IOSurfaceUnlock(s, 0, NULL);
 }
 
-// fp32 IOSurface I/O (for dynamic matmul kernels that use fp32 input/output)
+// fp16 IOSurface I/O (for dynamic matmul kernels with fp16 input/output)
 // Layout: [1, IC, 1, SP] where SP = SEQ + OC
 // Write activations at sp[0:SEQ] and weights at sp[SEQ:SEQ+OC]
 static void io_write_dyn(IOSurfaceRef s, const float *act, int ic, int seq,
                          const float *W, int oc) {
     int sp = seq + oc;
     IOSurfaceLock(s, 0, NULL);
-    float *buf = (float*)IOSurfaceGetBaseAddress(s);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
     for (int d = 0; d < ic; d++) {
-        memcpy(buf + d*sp, act + d*seq, seq*4);
-        memcpy(buf + d*sp + seq, W + d*oc, oc*4);
+        cvt_f32_f16(buf + d*sp, act + d*seq, seq);
+        cvt_f32_f16(buf + d*sp + seq, W + d*oc, oc);
     }
     IOSurfaceUnlock(s, 0, NULL);
 }
@@ -92,7 +92,7 @@ static void io_write_dyn(IOSurfaceRef s, const float *act, int ic, int seq,
 // Read output from dynamic matmul kernel: [1, OC, 1, SEQ]
 static void io_read_dyn(IOSurfaceRef s, float *out, int oc, int seq) {
     IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
-    memcpy(out, (float*)IOSurfaceGetBaseAddress(s), oc * seq * 4);
+    cvt_f16_f32(out, (_Float16*)IOSurfaceGetBaseAddress(s), oc * seq);
     IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
 }
 
@@ -144,4 +144,202 @@ static void free_kern(Kern *k) {
 static void ane_eval(Kern *k) {
     id mdl = (__bridge id)k->model; id req = (__bridge id)k->request; NSError *e = nil;
     ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+}
+
+// Evaluate with a per-layer request (different ioIn, same model)
+static void ane_eval_req(Kern *k, void *request) {
+    id mdl = (__bridge id)k->model; id req = (__bridge id)request; NSError *e = nil;
+    ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+}
+
+// Create an ANE request binding a custom ioIn to a kernel's model+ioOut
+static void *make_request(Kern *k, IOSurfaceRef ioIn) {
+    id wI = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioIn);
+    id wO = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
+    id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+        @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+        @[wI], @[@0], @[wO], @[@0], nil, nil, @0);
+    return (void*)CFBridgingRetain(req);
+}
+
+// ===== Per-layer weight staging (write once, reuse across steps) =====
+// All surfaces are now fp16 — staging converts fp32 weights to fp16
+
+// sdpaFwd: [1, DIM, 1, SEQ+4*DIM] fp16 — weights at sp[SEQ:]
+static void stage_sdpa_fwd_weights(IOSurfaceRef s, const float *Wq, const float *Wk,
+                                    const float *Wv, const float *Wo) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + 4*DIM;
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*sp + SEQ,       Wq + d*DIM, DIM);
+        cvt_f32_f16(buf + d*sp + SEQ+DIM,   Wk + d*DIM, DIM);
+        cvt_f32_f16(buf + d*sp + SEQ+2*DIM, Wv + d*DIM, DIM);
+        cvt_f32_f16(buf + d*sp + SEQ+3*DIM, Wo + d*DIM, DIM);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_sdpa_fwd_acts(IOSurfaceRef s, const float *xnorm) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + 4*DIM;
+    for (int d = 0; d < DIM; d++)
+        cvt_f32_f16(buf + d*sp, xnorm + d*SEQ, SEQ);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// ffnFused: [1, DIM, 1, 2*SEQ+3*HIDDEN] fp16
+static void stage_ffn_fused_weights(IOSurfaceRef s,
+                                     const float *W1t, const float *W3t, const float *W2_orig) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = 2*SEQ + 3*HIDDEN;
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*sp + 2*SEQ,          W1t + d*HIDDEN, HIDDEN);
+        cvt_f32_f16(buf + d*sp + 2*SEQ+HIDDEN,   W3t + d*HIDDEN, HIDDEN);
+        cvt_f32_f16(buf + d*sp + 2*SEQ+2*HIDDEN, W2_orig + d*HIDDEN, HIDDEN);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_ffn_fused_acts(IOSurfaceRef s, const float *x2norm, const float *x2) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = 2*SEQ + 3*HIDDEN;
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*sp,       x2norm + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*sp + SEQ, x2 + d*SEQ, SEQ);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// ffnW13: [1, DIM, 1, SEQ+2*HIDDEN] fp16
+static void stage_ffn_w13_weights(IOSurfaceRef s, const float *W1, const float *W3) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + 2*HIDDEN;
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*sp + SEQ,        W1 + d*HIDDEN, HIDDEN);
+        cvt_f32_f16(buf + d*sp + SEQ+HIDDEN, W3 + d*HIDDEN, HIDDEN);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_ffn_w13_acts(IOSurfaceRef s, const float *xnorm) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + 2*HIDDEN;
+    for (int d = 0; d < DIM; d++)
+        cvt_f32_f16(buf + d*sp, xnorm + d*SEQ, SEQ);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// ffnW2: [1, HIDDEN, 1, SEQ+DIM] fp16
+static void stage_ffn_w2_weights(IOSurfaceRef s, const float *W2) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + DIM;
+    for (int d = 0; d < HIDDEN; d++)
+        cvt_f32_f16(buf + d*sp + SEQ, W2 + d*DIM, DIM);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_ffn_w2_acts(IOSurfaceRef s, const float *gate) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + DIM;
+    for (int d = 0; d < HIDDEN; d++)
+        cvt_f32_f16(buf + d*sp, gate + d*SEQ, SEQ);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// ffnBwdW2t: [1, DIM, 1, SEQ+HIDDEN] fp16
+static void stage_ffn_bwd_w2t_weights(IOSurfaceRef s, const float *W2) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + HIDDEN;
+    for (int d = 0; d < DIM; d++)
+        cvt_f32_f16(buf + d*sp + SEQ, W2 + d*HIDDEN, HIDDEN);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_ffn_bwd_w2t_acts(IOSurfaceRef s, const float *dffn) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + HIDDEN;
+    for (int d = 0; d < DIM; d++)
+        cvt_f32_f16(buf + d*sp, dffn + d*SEQ, SEQ);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// ffnBwdW13t: [1, HIDDEN, 1, 2*SEQ+2*DIM] fp16
+static void stage_ffn_bwd_w13t_weights(IOSurfaceRef s, const float *W1, const float *W3) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = 2*SEQ + 2*DIM;
+    for (int d = 0; d < HIDDEN; d++) {
+        cvt_f32_f16(buf + d*sp + 2*SEQ,       W1 + d*DIM, DIM);
+        cvt_f32_f16(buf + d*sp + 2*SEQ + DIM, W3 + d*DIM, DIM);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_ffn_bwd_w13t_acts(IOSurfaceRef s, const float *dh1, const float *dh3) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = 2*SEQ + 2*DIM;
+    for (int d = 0; d < HIDDEN; d++) {
+        cvt_f32_f16(buf + d*sp,       dh1 + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*sp + SEQ, dh3 + d*SEQ, SEQ);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// wotBwd: [1, DIM, 1, SEQ+DIM] fp16
+static void stage_wot_bwd_weights(IOSurfaceRef s, const float *Wo) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + DIM;
+    for (int d = 0; d < DIM; d++)
+        cvt_f32_f16(buf + d*sp + SEQ, Wo + d*DIM, DIM);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_wot_bwd_acts(IOSurfaceRef s, const float *dx2) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = SEQ + DIM;
+    for (int d = 0; d < DIM; d++)
+        cvt_f32_f16(buf + d*sp, dx2 + d*SEQ, SEQ);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// qkvBwd: [1, DIM, 1, 3*SEQ+3*DIM] fp16
+static void stage_qkv_bwd_weights(IOSurfaceRef s, const float *Wq, const float *Wk, const float *Wv) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = 3*SEQ + 3*DIM;
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*sp + 3*SEQ,         Wq + d*DIM, DIM);
+        cvt_f32_f16(buf + d*sp + 3*SEQ + DIM,   Wk + d*DIM, DIM);
+        cvt_f32_f16(buf + d*sp + 3*SEQ + 2*DIM, Wv + d*DIM, DIM);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_qkv_bwd_acts(IOSurfaceRef s, const float *dq, const float *dk, const float *dv) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    int sp = 3*SEQ + 3*DIM;
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*sp,       dq + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*sp + SEQ, dk + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*sp + 2*SEQ, dv + d*SEQ, SEQ);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+// Free per-layer surfaces and requests
+static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
+    for (int L = 0; L < NLAYERS; L++) {
+        CFRelease(pls[L].sdpaFwd_in); CFRelease(pls[L].ffnFused_in);
+        CFRelease(pls[L].ffnBwdW2t_in); CFRelease(pls[L].ffnBwdW13t_in);
+        CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qkvBwd_in);
+        CFRelease(plr[L].sdpaFwd); CFRelease(plr[L].ffnFused);
+        CFRelease(plr[L].ffnBwdW2t); CFRelease(plr[L].ffnBwdW13t);
+        CFRelease(plr[L].wotBwd); CFRelease(plr[L].qkvBwd);
+    }
 }

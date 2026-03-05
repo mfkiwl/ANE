@@ -62,6 +62,18 @@ typedef struct {
 // ANE kernel handle
 typedef struct { void *model; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
 
+// Per-layer IOSurfaces for pre-staged weights
+typedef struct {
+    IOSurfaceRef sdpaFwd_in, ffnFused_in;
+    IOSurfaceRef ffnBwdW2t_in, ffnBwdW13t_in, wotBwd_in, qkvBwd_in;
+} PerLayerSurfaces;
+
+// Per-layer ANE requests (bound to per-layer IOSurfaces)
+typedef struct {
+    void *sdpaFwd, *ffnFused;
+    void *ffnBwdW2t, *ffnBwdW13t, *wotBwd, *qkvBwd;
+} PerLayerRequests;
+
 // Checkpoint header
 typedef struct {
     int magic, version, step, total_steps;
